@@ -92,10 +92,9 @@ Description=PANOSETI DAQ startup - launches all installed CLI tools
 After=network.target
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=$RUNNER_SCRIPT
-Restart=on-failure
-RestartSec=5
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
