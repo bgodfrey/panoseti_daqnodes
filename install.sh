@@ -5,11 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 SERVICE_NAME="pseti_daq_startup"
+DAEMON_SERVICE_NAME="pseti_daq_daemons"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/${SERVICE_NAME}.service"
+DAEMON_SERVICE_FILE="$SYSTEMD_USER_DIR/${DAEMON_SERVICE_NAME}.service"
 RUNNER_SCRIPT="$SCRIPT_DIR/scripts/run_daq_tools.sh"
+DAEMON_RUNNER_SCRIPT="$SCRIPT_DIR/scripts/run_daq_daemons.sh"
 UV_BIN_DIR="$HOME/.local/bin"
 DEPLOYED_RUNNER_SCRIPT="$UV_BIN_DIR/run_daq_tools.sh"
+DEPLOYED_DAEMON_RUNNER_SCRIPT="$UV_BIN_DIR/run_daq_daemons.sh"
 TOOLS_TOML="$SCRIPT_DIR/pseti-tools.toml"
 TOOL_SOURCES_DIR="$SCRIPT_DIR/.tool-sources"
 SEP_WIDTH=68
@@ -68,16 +72,17 @@ enable_linger() {
 }
 
 # Parse $TOOLS_TOML into the parallel arrays
-# TOOL_NAMES/TOOL_SOURCES/TOOL_BRANCHES/TOOL_CMDS. The format is a flat set
-# of [name] sections, each with "source", "branch", and "cmd" keys (quoted
-# or unquoted); comments start with #.
+# TOOL_NAMES/TOOL_SOURCES/TOOL_BRANCHES/TOOL_CMDS/TOOL_MODES. The format is
+# a flat set of [name] sections, each with "source", "branch", "cmd", and
+# "mode" keys (quoted or unquoted); comments start with #.
 parse_tools_toml() {
   TOOL_NAMES=()
   TOOL_SOURCES=()
   TOOL_BRANCHES=()
   TOOL_CMDS=()
+  TOOL_MODES=()
 
-  local current_name="" current_source="" current_branch="" current_cmd=""
+  local current_name="" current_source="" current_branch="" current_cmd="" current_mode=""
   local line key val
 
   flush_tool() {
@@ -86,6 +91,7 @@ parse_tools_toml() {
       TOOL_SOURCES+=("$current_source")
       TOOL_BRANCHES+=("$current_branch")
       TOOL_CMDS+=("$current_cmd")
+      TOOL_MODES+=("$current_mode")
     fi
   }
 
@@ -100,6 +106,7 @@ parse_tools_toml() {
       current_source=""
       current_branch=""
       current_cmd=""
+      current_mode=""
     elif [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
       val="${BASH_REMATCH[2]}"
@@ -109,6 +116,7 @@ parse_tools_toml() {
         source) current_source="$val" ;;
         branch) current_branch="$val" ;;
         cmd) current_cmd="$val" ;;
+        mode) current_mode="$val" ;;
       esac
     fi
   done < "$TOOLS_TOML"
@@ -209,53 +217,93 @@ install_tools() {
   uv tool list
 }
 
-# 4. Create (or update) the pseti_daq_startup systemd --user service.
-#    Always (re)writes the service file with the current config, even if
-#    one already exists.
-create_systemd_service() {
-  mkdir -p "$SYSTEMD_USER_DIR"
-  mkdir -p "$(dirname "$RUNNER_SCRIPT")"
+# Generate a runner script at `out` from the tools in $TOOLS_TOML whose
+# mode matches `want_mode` ("oneshot" tools have no mode set, or mode !=
+# "daemon"). Every matching tool is started in the background and its pid
+# collected; how those pids are used afterward depends on `want_mode`:
+#   oneshot: wait for all of them, so the script (and the oneshot systemd
+#            unit running it) finishes once every tool has exited
+#   daemon:  exit as soon as any one of them exits (crash or otherwise) and
+#            kill the rest, so systemd (Restart=on-failure) restarts the
+#            whole group together
+generate_runner_script() {
+  local out="$1" want_mode="$2"
+  mkdir -p "$(dirname "$out")"
 
-  # 5. Generate the runner script that starts every tool's "cmd" from
-  #    $TOOLS_TOML in parallel after boot
-  parse_tools_toml
   {
     echo '#!/usr/bin/env bash'
     echo 'set -uo pipefail'
     echo 'export PATH="$HOME/.local/bin:$PATH"'
     echo ''
     echo 'pids=()'
+    echo 'started=0'
     echo ''
-    local i cmd
+    local i cmd mode is_daemon
     for ((i = 0; i < ${#TOOL_NAMES[@]}; i++)); do
+      mode="${TOOL_MODES[$i]}"
+      [ "$mode" = "daemon" ] && is_daemon=1 || is_daemon=0
+      if [ "$want_mode" = "daemon" ] && [ "$is_daemon" -ne 1 ]; then continue; fi
+      if [ "$want_mode" = "oneshot" ] && [ "$is_daemon" -eq 1 ]; then continue; fi
+
       cmd="${TOOL_CMDS[$i]}"
       [ -z "$cmd" ] && continue
       printf 'echo "Starting: %s"\n' "$cmd"
       printf '%s &\n' "$cmd"
+      echo 'started=$((started + 1))'
       echo 'pids+=("$!")'
       echo ''
     done
-    echo 'if [ "${#pids[@]}" -eq 0 ]; then'
-    echo '  echo "No tools configured in pseti-tools.toml, nothing to start."'
+    echo 'if [ "$started" -eq 0 ]; then'
+    echo "  echo \"No $want_mode tools configured in pseti-tools.toml, nothing to start.\""
     echo '  exit 0'
     echo 'fi'
     echo ''
-    echo '# Wait for all tool processes in parallel; one exiting does not affect the others'
-    echo 'wait "${pids[@]}"'
-  } > "$RUNNER_SCRIPT"
-  chmod +x "$RUNNER_SCRIPT"
+    if [ "$want_mode" = "daemon" ]; then
+      echo '# Exit as soon as any one tool exits, and stop the rest, so systemd'
+      echo '# restarts the whole group together.'
+      echo 'wait -n "${pids[@]}"'
+      echo 'code=$?'
+      echo 'kill "${pids[@]}" 2>/dev/null || true'
+      echo 'exit "$code"'
+    else
+      echo 'wait "${pids[@]}"'
+    fi
+  } > "$out"
+  chmod +x "$out"
+}
 
-  # Deploy a copy to ~/.local/bin so the service keeps working even if this
-  # repo checkout is later moved or deleted.
+# Deploy `src` to `dest` (in ~/.local/bin) so the service keeps working even
+# if this repo checkout is later moved or deleted.
+deploy_runner_script() {
+  local src="$1" dest="$2"
   mkdir -p "$UV_BIN_DIR"
-  cp "$RUNNER_SCRIPT" "$DEPLOYED_RUNNER_SCRIPT"
-  chmod +x "$DEPLOYED_RUNNER_SCRIPT"
-  log "Deployed runner script to $DEPLOYED_RUNNER_SCRIPT"
+  cp "$src" "$dest"
+  chmod +x "$dest"
+  log "Deployed runner script to $dest"
+}
+
+# 4. Create (or update) both systemd --user services:
+#      pseti_daq_startup  (oneshot)  - runs every non-daemon tool once
+#      pseti_daq_daemons  (simple)   - runs every daemon tool, restarted on
+#                                      crash
+#    Always (re)writes both service files with the current config, even if
+#    they already exist.
+create_systemd_services() {
+  mkdir -p "$SYSTEMD_USER_DIR"
+
+  # 5. Generate the two runner scripts from $TOOLS_TOML: one for the
+  #    default "oneshot" tools, one for tools with mode = "daemon".
+  parse_tools_toml
+  generate_runner_script "$RUNNER_SCRIPT" oneshot
+  generate_runner_script "$DAEMON_RUNNER_SCRIPT" daemon
+
+  deploy_runner_script "$RUNNER_SCRIPT" "$DEPLOYED_RUNNER_SCRIPT"
+  deploy_runner_script "$DAEMON_RUNNER_SCRIPT" "$DEPLOYED_DAEMON_RUNNER_SCRIPT"
 
   log "Creating/updating systemd user service: $SERVICE_FILE"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=PANOSETI DAQ startup - launches all installed CLI tools
+Description=PANOSETI DAQ startup - runs each oneshot tool once
 After=network.target
 
 [Service]
@@ -268,48 +316,73 @@ Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 WantedBy=default.target
 EOF
 
+  log "Creating/updating systemd user service: $DAEMON_SERVICE_FILE"
+  cat > "$DAEMON_SERVICE_FILE" <<EOF
+[Unit]
+Description=PANOSETI DAQ daemons - runs each daemon tool, restarted on crash
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$DEPLOYED_DAEMON_RUNNER_SCRIPT
+Restart=on-failure
+RestartSec=5
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+EOF
+
   systemctl --user daemon-reload
   systemctl --user enable "${SERVICE_NAME}.service"
+  systemctl --user enable "${DAEMON_SERVICE_NAME}.service"
 
-  local enabled_status
+  local enabled_status daemon_enabled_status
   enabled_status="$(systemctl --user is-enabled "${SERVICE_NAME}.service" 2>&1 || true)"
+  daemon_enabled_status="$(systemctl --user is-enabled "${DAEMON_SERVICE_NAME}.service" 2>&1 || true)"
   log "Status: ${SERVICE_NAME}.service enabled = $enabled_status"
+  log "Status: ${DAEMON_SERVICE_NAME}.service enabled = $daemon_enabled_status"
 }
 
-# Start (or restart) the systemd --user service right now
-start_systemd_service() {
+# Start (or restart) both systemd --user services right now
+start_systemd_services() {
   log "Starting ${SERVICE_NAME}.service..."
   systemctl --user start "${SERVICE_NAME}.service"
+  log "Starting ${DAEMON_SERVICE_NAME}.service..."
+  systemctl --user start "${DAEMON_SERVICE_NAME}.service"
 
-  local active_status
+  local active_status daemon_active_status
   active_status="$(systemctl --user is-active "${SERVICE_NAME}.service" 2>&1 || true)"
+  daemon_active_status="$(systemctl --user is-active "${DAEMON_SERVICE_NAME}.service" 2>&1 || true)"
   log "Status: ${SERVICE_NAME}.service active = $active_status"
+  log "Status: ${DAEMON_SERVICE_NAME}.service active = $daemon_active_status"
 }
 
-# Stop, disable, and remove the pseti_daq_startup systemd --user service
-remove_systemd_service() {
-  log "Stopping and disabling ${SERVICE_NAME}.service..."
-  systemctl --user stop "${SERVICE_NAME}.service" 2>/dev/null || true
-  systemctl --user disable "${SERVICE_NAME}.service" 2>/dev/null || true
+# Stop, disable, and remove both pseti_daq systemd --user services
+remove_systemd_services() {
+  local svc
+  for svc in "$SERVICE_NAME" "$DAEMON_SERVICE_NAME"; do
+    log "Stopping and disabling ${svc}.service..."
+    systemctl --user stop "${svc}.service" 2>/dev/null || true
+    systemctl --user disable "${svc}.service" 2>/dev/null || true
+  done
 
-  if [ -f "$SERVICE_FILE" ]; then
-    rm -f "$SERVICE_FILE"
-    log "Removed $SERVICE_FILE"
-  fi
-  if [ -f "$RUNNER_SCRIPT" ]; then
-    rm -f "$RUNNER_SCRIPT"
-    log "Removed $RUNNER_SCRIPT"
-  fi
-  if [ -f "$DEPLOYED_RUNNER_SCRIPT" ]; then
-    rm -f "$DEPLOYED_RUNNER_SCRIPT"
-    log "Removed $DEPLOYED_RUNNER_SCRIPT"
-  fi
+  local f
+  for f in "$SERVICE_FILE" "$DAEMON_SERVICE_FILE" "$RUNNER_SCRIPT" "$DAEMON_RUNNER_SCRIPT" \
+           "$DEPLOYED_RUNNER_SCRIPT" "$DEPLOYED_DAEMON_RUNNER_SCRIPT"; do
+    if [ -f "$f" ]; then
+      rm -f "$f"
+      log "Removed $f"
+    fi
+  done
 
   systemctl --user daemon-reload
 
-  local enabled_status
+  local enabled_status daemon_enabled_status
   enabled_status="$(systemctl --user is-enabled "${SERVICE_NAME}.service" 2>&1 || true)"
+  daemon_enabled_status="$(systemctl --user is-enabled "${DAEMON_SERVICE_NAME}.service" 2>&1 || true)"
   log "Status: ${SERVICE_NAME}.service = $enabled_status"
+  log "Status: ${DAEMON_SERVICE_NAME}.service = $daemon_enabled_status"
 }
 
 # Disable linger for the current user
@@ -366,13 +439,15 @@ Commands:
                    under .tool-sources/<name> and "uv tool install ." from
                    there; for source = "public", "uv tool install <name>"
                    from PyPI
-  linger_service   Create/update and start the ${SERVICE_NAME} systemd --user
-                   service. The service runs each tool's "cmd" from
-                   pseti-tools.toml after boot. Always overwrites the
-                   service file with the current config.
+  linger_service   Create/update and start both systemd --user services:
+                   ${SERVICE_NAME} (oneshot; runs each non-daemon tool's
+                   "cmd" once after boot) and ${DAEMON_SERVICE_NAME}
+                   (restarted on crash; runs each tool with mode = "daemon").
+                   Always overwrites both service files with the current
+                   config.
   clean            Restore the system to its pre-install state: uninstall all
-                   uv-installed CLI tools, stop/disable/remove the
-                   ${SERVICE_NAME} service, and disable linger
+                   uv-installed CLI tools, stop/disable/remove both
+                   pseti_daq services, and disable linger
   -h, --help       Show this help message
 
 Examples:
@@ -391,9 +466,9 @@ main() {
       run_step "Install uv" install_uv
       run_step "Enable linger" enable_linger
       run_step "Install CLI tools" install_tools
-      run_step "Create/update systemd service" create_systemd_service
-      run_step "Start systemd service" start_systemd_service
-      log "All steps completed. '${SERVICE_NAME}' will auto-run every tool from pseti-tools.toml after boot."
+      run_step "Create/update systemd services" create_systemd_services
+      run_step "Start systemd services" start_systemd_services
+      log "All steps completed. '${SERVICE_NAME}' will run each oneshot tool once after boot; '${DAEMON_SERVICE_NAME}' will keep each daemon tool running, restarting it on crash."
       ;;
     uv)
       run_step "Install uv" install_uv
@@ -405,14 +480,14 @@ main() {
       run_step "Install CLI tools" install_tools
       ;;
     linger_service)
-      run_step "Create/update systemd service" create_systemd_service
-      run_step "Start systemd service" start_systemd_service
+      run_step "Create/update systemd services" create_systemd_services
+      run_step "Start systemd services" start_systemd_services
       ;;
     clean)
       run_step "Uninstall uv tools" uninstall_tools
-      run_step "Remove systemd service" remove_systemd_service
+      run_step "Remove systemd services" remove_systemd_services
       run_step "Disable linger" disable_linger
-      log "Clean complete: uv tools uninstalled, cached tool sources removed, ${SERVICE_NAME}.service removed, linger disabled."
+      log "Clean complete: uv tools uninstalled, cached tool sources removed, ${SERVICE_NAME}.service and ${DAEMON_SERVICE_NAME}.service removed, linger disabled."
       ;;
     -h|--help)
       print_help

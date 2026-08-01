@@ -8,8 +8,21 @@
 #   branch = required when source is a github URL: the branch to clone/pull
 #   cmd    = the command line "install.sh linger_service" adds to
 #            run_daq_tools.sh to start this tool at boot
+#   mode   = "oneshot" (default, if omitted): the cmd runs once and exits,
+#            e.g. a one-off configuration command; run_daq_tools.sh waits
+#            for it to finish.
+#            "daemon": the cmd runs forever, e.g. a long-running server;
+#            run_daq_tools.sh starts it in the background and does NOT wait
+#            for it, so the oneshot systemd service can still finish.
+
+[panoseti-grpc]
+source = "public"
+cmd = "pseti-grpc server --profile daq_node"
+mode = "daemon"
 
 [gnss-lbe]
 source = "https://github.com/liuweiseu/lbe1420_panoseti.git"
 branch = "feature/profile"
 cmd = "gnss-lbe --profile palomar"
+
+
