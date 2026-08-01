@@ -40,16 +40,25 @@ clone_submodules() {
   git -C "$SCRIPT_DIR" submodule update --init --recursive
 }
 
-# 4. Enter each submodule and install its CLI tool
+# 4. Enter each submodule and install its CLI tool. If the tool is already
+#    installed, force a reinstall so the latest local version is picked up.
 install_submodule_tools() {
   log "Installing CLI tools from submodules..."
   git -C "$SCRIPT_DIR" submodule foreach --quiet '
     echo "  -> Installing tool from submodule: $name"
-    uv tool install . || echo "  !! Failed to install tool from $name, skipping"
+    pkg_name=$(grep "^name" pyproject.toml | head -n1 | cut -d\" -f2)
+    if [ -n "$pkg_name" ] && uv tool list 2>/dev/null | grep -qE "^${pkg_name}[[:space:]]"; then
+      echo "     $pkg_name is already installed, reinstalling to get the latest version..."
+      uv tool install --reinstall . || echo "  !! Failed to reinstall tool from $name, skipping"
+    else
+      uv tool install . || echo "  !! Failed to install tool from $name, skipping"
+    fi
   '
 }
 
-# 5. Create the pseti_daq_startup systemd --user service (skip if it already exists)
+# 5. Create (or update) the pseti_daq_startup systemd --user service.
+#    Always (re)writes the service file with the current config, even if
+#    one already exists.
 create_systemd_service() {
   mkdir -p "$SYSTEMD_USER_DIR"
   mkdir -p "$(dirname "$RUNNER_SCRIPT")"
@@ -80,12 +89,7 @@ wait "${pids[@]}"
 EOF
   chmod +x "$RUNNER_SCRIPT"
 
-  if [ -f "$SERVICE_FILE" ]; then
-    log "Service file $SERVICE_FILE already exists, skipping creation."
-    return
-  fi
-
-  log "Creating systemd user service: $SERVICE_FILE"
+  log "Creating/updating systemd user service: $SERVICE_FILE"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=PANOSETI DAQ startup - launches all installed CLI tools
@@ -112,6 +116,65 @@ start_systemd_service() {
   systemctl --user start "${SERVICE_NAME}.service"
 }
 
+# Stop, disable, and remove the pseti_daq_startup systemd --user service
+remove_systemd_service() {
+  log "Stopping and disabling ${SERVICE_NAME}.service..."
+  systemctl --user stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  systemctl --user disable "${SERVICE_NAME}.service" 2>/dev/null || true
+
+  if [ -f "$SERVICE_FILE" ]; then
+    rm -f "$SERVICE_FILE"
+    log "Removed $SERVICE_FILE"
+  fi
+  if [ -f "$RUNNER_SCRIPT" ]; then
+    rm -f "$RUNNER_SCRIPT"
+    log "Removed $RUNNER_SCRIPT"
+  fi
+
+  systemctl --user daemon-reload
+}
+
+# Disable linger for the current user
+disable_linger() {
+  log "Disabling linger for user $USER..."
+  loginctl disable-linger "$USER"
+
+  local linger_status
+  linger_status="$(loginctl show-user "$USER" --property=Linger --value)"
+  log "Linger status for $USER: $linger_status"
+}
+
+# Uninstall every CLI tool that was installed via "uv tool install"
+uninstall_tools() {
+  log "Uninstalling uv-installed CLI tools..."
+  if ! command -v uv >/dev/null 2>&1; then
+    log "uv is not installed, nothing to uninstall."
+    return
+  fi
+
+  local packages
+  mapfile -t packages < <(uv tool list 2>/dev/null | awk '!/^- /{print $1}')
+
+  if [ "${#packages[@]}" -eq 0 ]; then
+    log "No uv tools installed."
+    return
+  fi
+
+  for pkg in "${packages[@]}"; do
+    log "Uninstalling $pkg..."
+    uv tool uninstall "$pkg" || log "  !! Failed to uninstall $pkg"
+  done
+}
+
+# Restore the system to its pre-install state: uninstall the uv tools,
+# remove the systemd service, and disable linger
+clean() {
+  uninstall_tools
+  remove_systemd_service
+  disable_linger
+  log "Done. Uninstalled uv tools, removed ${SERVICE_NAME}.service, and disabled linger."
+}
+
 print_help() {
   cat <<EOF
 Usage: $(basename "$0") <command>
@@ -122,15 +185,20 @@ Commands:
   enable_linger    Enable linger for the current user (loginctl enable-linger)
   submodule        Clone/update all git submodules
   tools            Install the CLI tool from each submodule (uv tool install .)
-  linger_service   Create (if missing) and start the ${SERVICE_NAME} systemd --user
-                   service, which runs every installed CLI tool with --profile palomar
-                   after boot
+  linger_service   Create/update and start the ${SERVICE_NAME} systemd --user
+                   service, which runs every installed CLI tool with
+                   --profile palomar after boot. Always overwrites the
+                   service file with the current config.
+  clean            Restore the system to its pre-install state: uninstall all
+                   uv-installed CLI tools, stop/disable/remove the
+                   ${SERVICE_NAME} service, and disable linger
   -h, --help       Show this help message
 
 Examples:
   $(basename "$0") all
   $(basename "$0") uv
   $(basename "$0") linger_service
+  $(basename "$0") clean
 EOF
 }
 
@@ -162,6 +230,9 @@ main() {
     linger_service)
       create_systemd_service
       start_systemd_service
+      ;;
+    clean)
+      clean
       ;;
     -h|--help)
       print_help
