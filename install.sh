@@ -9,18 +9,35 @@ SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/${SERVICE_NAME}.service"
 RUNNER_SCRIPT="$SCRIPT_DIR/scripts/run_daq_tools.sh"
 UV_BIN_DIR="$HOME/.local/bin"
+SEP="--------------------------------------------------------------------"
 
 log() { echo "[install.sh] $*"; }
+
+# Run one step wrapped in clear separators, so multi-step output (e.g. "all")
+# doesn't run together and each step's completion is obvious.
+run_step() {
+  local desc="$1"
+  shift
+  echo ""
+  echo "$SEP"
+  echo "[install.sh] STEP: $desc"
+  echo "$SEP"
+  "$@"
+  echo "$SEP"
+  echo "[install.sh] DONE: $desc"
+  echo "$SEP"
+}
 
 # 1. Install uv (skip if already installed)
 install_uv() {
   if command -v uv >/dev/null 2>&1; then
     log "uv already installed: $(command -v uv)"
-    return
+  else
+    log "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$UV_BIN_DIR:$PATH"
   fi
-  log "Installing uv..."
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$UV_BIN_DIR:$PATH"
+  log "Status: uv version $(uv --version)"
 }
 
 # 2. Enable linger for the current user, so systemd --user services can
@@ -31,13 +48,16 @@ enable_linger() {
 
   local linger_status
   linger_status="$(loginctl show-user "$USER" --property=Linger --value)"
-  log "Linger status for $USER: $linger_status"
+  log "Status: linger for $USER = $linger_status"
 }
 
 # 3. Clone all submodules
 clone_submodules() {
   log "Initializing and updating submodules..."
   git -C "$SCRIPT_DIR" submodule update --init --recursive
+
+  log "Status: submodule commits"
+  git -C "$SCRIPT_DIR" submodule status
 }
 
 # 4. Enter each submodule and install its CLI tool. If the tool is already
@@ -49,11 +69,14 @@ install_submodule_tools() {
     pkg_name=$(grep "^name" pyproject.toml | head -n1 | cut -d\" -f2)
     if [ -n "$pkg_name" ] && uv tool list 2>/dev/null | grep -qE "^${pkg_name}[[:space:]]"; then
       echo "     $pkg_name is already installed, reinstalling to get the latest version..."
-      uv tool install --reinstall . || echo "  !! Failed to reinstall tool from $name, skipping"
+      uv tool install -q --reinstall . || echo "  !! Failed to reinstall tool from $name, skipping"
     else
-      uv tool install . || echo "  !! Failed to install tool from $name, skipping"
+      uv tool install -q . || echo "  !! Failed to install tool from $name, skipping"
     fi
   '
+
+  log "Status: installed uv tools"
+  uv tool list
 }
 
 # 5. Create (or update) the pseti_daq_startup systemd --user service.
@@ -107,13 +130,20 @@ EOF
 
   systemctl --user daemon-reload
   systemctl --user enable "${SERVICE_NAME}.service"
-  log "Service ${SERVICE_NAME}.service created and enabled."
+
+  local enabled_status
+  enabled_status="$(systemctl --user is-enabled "${SERVICE_NAME}.service" 2>&1 || true)"
+  log "Status: ${SERVICE_NAME}.service enabled = $enabled_status"
 }
 
 # Start (or restart) the systemd --user service right now
 start_systemd_service() {
   log "Starting ${SERVICE_NAME}.service..."
   systemctl --user start "${SERVICE_NAME}.service"
+
+  local active_status
+  active_status="$(systemctl --user is-active "${SERVICE_NAME}.service" 2>&1 || true)"
+  log "Status: ${SERVICE_NAME}.service active = $active_status"
 }
 
 # Stop, disable, and remove the pseti_daq_startup systemd --user service
@@ -132,6 +162,10 @@ remove_systemd_service() {
   fi
 
   systemctl --user daemon-reload
+
+  local enabled_status
+  enabled_status="$(systemctl --user is-enabled "${SERVICE_NAME}.service" 2>&1 || true)"
+  log "Status: ${SERVICE_NAME}.service = $enabled_status"
 }
 
 # Disable linger for the current user
@@ -141,14 +175,14 @@ disable_linger() {
 
   local linger_status
   linger_status="$(loginctl show-user "$USER" --property=Linger --value)"
-  log "Linger status for $USER: $linger_status"
+  log "Status: linger for $USER = $linger_status"
 }
 
 # Uninstall every CLI tool that was installed via "uv tool install"
 uninstall_tools() {
   log "Uninstalling uv-installed CLI tools..."
   if ! command -v uv >/dev/null 2>&1; then
-    log "uv is not installed, nothing to uninstall."
+    log "Status: uv is not installed, nothing to uninstall."
     return
   fi
 
@@ -156,23 +190,17 @@ uninstall_tools() {
   mapfile -t packages < <(uv tool list 2>/dev/null | awk '!/^- /{print $1}')
 
   if [ "${#packages[@]}" -eq 0 ]; then
-    log "No uv tools installed."
+    log "Status: no uv tools installed."
     return
   fi
 
   for pkg in "${packages[@]}"; do
     log "Uninstalling $pkg..."
-    uv tool uninstall "$pkg" || log "  !! Failed to uninstall $pkg"
+    uv tool uninstall -q "$pkg" || log "  !! Failed to uninstall $pkg"
   done
-}
 
-# Restore the system to its pre-install state: uninstall the uv tools,
-# remove the systemd service, and disable linger
-clean() {
-  uninstall_tools
-  remove_systemd_service
-  disable_linger
-  log "Done. Uninstalled uv tools, removed ${SERVICE_NAME}.service, and disabled linger."
+  log "Status: remaining uv tools"
+  uv tool list
 }
 
 print_help() {
@@ -207,32 +235,35 @@ main() {
 
   case "$cmd" in
     all)
-      install_uv
-      enable_linger
-      clone_submodules
-      install_submodule_tools
-      create_systemd_service
-      start_systemd_service
-      log "Done. '${SERVICE_NAME}' will auto-run all installed CLI tools with --profile palomar after boot."
+      run_step "Install uv" install_uv
+      run_step "Enable linger" enable_linger
+      run_step "Clone submodules" clone_submodules
+      run_step "Install submodule CLI tools" install_submodule_tools
+      run_step "Create/update systemd service" create_systemd_service
+      run_step "Start systemd service" start_systemd_service
+      log "All steps completed. '${SERVICE_NAME}' will auto-run all installed CLI tools with --profile palomar after boot."
       ;;
     uv)
-      install_uv
+      run_step "Install uv" install_uv
       ;;
     enable_linger)
-      enable_linger
+      run_step "Enable linger" enable_linger
       ;;
     submodule)
-      clone_submodules
+      run_step "Clone submodules" clone_submodules
       ;;
     tools)
-      install_submodule_tools
+      run_step "Install submodule CLI tools" install_submodule_tools
       ;;
     linger_service)
-      create_systemd_service
-      start_systemd_service
+      run_step "Create/update systemd service" create_systemd_service
+      run_step "Start systemd service" start_systemd_service
       ;;
     clean)
-      clean
+      run_step "Uninstall uv tools" uninstall_tools
+      run_step "Remove systemd service" remove_systemd_service
+      run_step "Disable linger" disable_linger
+      log "Clean complete: uv tools uninstalled, ${SERVICE_NAME}.service removed, linger disabled."
       ;;
     -h|--help)
       print_help
