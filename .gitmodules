@@ -1,0 +1,4 @@
+[submodule "gnss_lbe"]
+	path = gnss_lbe
+	url = https://github.com/liuweiseu/lbe1420_panoseti.git
+	branch = feature/profile
