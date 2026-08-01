@@ -9,9 +9,23 @@ SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/${SERVICE_NAME}.service"
 RUNNER_SCRIPT="$SCRIPT_DIR/scripts/run_daq_tools.sh"
 UV_BIN_DIR="$HOME/.local/bin"
-SEP="--------------------------------------------------------------------"
+DEPLOYED_RUNNER_SCRIPT="$UV_BIN_DIR/run_daq_tools.sh"
+SEP_WIDTH=68
+SEP="$(printf '%*s' "$SEP_WIDTH" '' | tr ' ' '-')"
 
 log() { echo "[install.sh] $*"; }
+
+# Center `text` within `width`, padding both sides with `padchar`.
+center_line() {
+  local text="$1" width="$2" padchar="$3"
+  local total_pad=$(( width - ${#text} ))
+  if [ "$total_pad" -lt 0 ]; then total_pad=0; fi
+  local left=$(( total_pad / 2 ))
+  local right=$(( total_pad - left ))
+  printf '%s' "$(printf '%*s' "$left" '' | tr ' ' "$padchar")"
+  printf '%s' "$text"
+  printf '%s' "$(printf '%*s' "$right" '' | tr ' ' "$padchar")"
+}
 
 # Run one step wrapped in clear separators, so multi-step output (e.g. "all")
 # doesn't run together and each step's completion is obvious.
@@ -19,13 +33,13 @@ run_step() {
   local desc="$1"
   shift
   echo ""
-  echo "$SEP"
-  echo "[install.sh] STEP: $desc"
-  echo "$SEP"
+  log "$SEP"
+  log "$(center_line " STEP: $desc " "$SEP_WIDTH" '*')"
+  log "$SEP"
   "$@"
-  echo "$SEP"
-  echo "[install.sh] DONE: $desc"
-  echo "$SEP"
+  log "$SEP"
+  log "$(center_line " DONE: $desc " "$SEP_WIDTH" '*')"
+  log "$SEP"
 }
 
 # 1. Install uv (skip if already installed)
@@ -112,6 +126,13 @@ wait "${pids[@]}"
 EOF
   chmod +x "$RUNNER_SCRIPT"
 
+  # Deploy a copy to ~/.local/bin so the service keeps working even if this
+  # repo checkout is later moved or deleted.
+  mkdir -p "$UV_BIN_DIR"
+  cp "$RUNNER_SCRIPT" "$DEPLOYED_RUNNER_SCRIPT"
+  chmod +x "$DEPLOYED_RUNNER_SCRIPT"
+  log "Deployed runner script to $DEPLOYED_RUNNER_SCRIPT"
+
   log "Creating/updating systemd user service: $SERVICE_FILE"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -121,7 +142,7 @@ After=network.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$RUNNER_SCRIPT
+ExecStart=$DEPLOYED_RUNNER_SCRIPT
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
@@ -159,6 +180,10 @@ remove_systemd_service() {
   if [ -f "$RUNNER_SCRIPT" ]; then
     rm -f "$RUNNER_SCRIPT"
     log "Removed $RUNNER_SCRIPT"
+  fi
+  if [ -f "$DEPLOYED_RUNNER_SCRIPT" ]; then
+    rm -f "$DEPLOYED_RUNNER_SCRIPT"
+    log "Removed $DEPLOYED_RUNNER_SCRIPT"
   fi
 
   systemctl --user daemon-reload
