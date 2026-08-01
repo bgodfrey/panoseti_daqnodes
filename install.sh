@@ -28,6 +28,10 @@ install_uv() {
 enable_linger() {
   log "Enabling linger for user $USER..."
   loginctl enable-linger "$USER"
+
+  local linger_status
+  linger_status="$(loginctl show-user "$USER" --property=Linger --value)"
+  log "Linger status for $USER: $linger_status"
 }
 
 # 3. Clone all submodules
