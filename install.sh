@@ -11,6 +11,7 @@ RUNNER_SCRIPT="$SCRIPT_DIR/scripts/run_daq_tools.sh"
 UV_BIN_DIR="$HOME/.local/bin"
 DEPLOYED_RUNNER_SCRIPT="$UV_BIN_DIR/run_daq_tools.sh"
 TOOLS_TOML="$SCRIPT_DIR/pseti-tools.toml"
+TOOL_SOURCES_DIR="$SCRIPT_DIR/.tool-sources"
 SEP_WIDTH=68
 SEP="$(printf '%*s' "$SEP_WIDTH" '' | tr ' ' '-')"
 
@@ -66,30 +67,24 @@ enable_linger() {
   log "Status: linger for $USER = $linger_status"
 }
 
-# 3. Clone all submodules
-clone_submodules() {
-  log "Initializing and updating submodules..."
-  git -C "$SCRIPT_DIR" submodule update --init --recursive
-
-  log "Status: submodule commits"
-  git -C "$SCRIPT_DIR" submodule status
-}
-
-# Parse $TOOLS_TOML into the parallel arrays TOOL_NAMES/TOOL_SOURCES/TOOL_CMDS.
-# The format is a flat set of [name] sections, each with "source" and "cmd"
-# keys (quoted or unquoted); comments start with #.
+# Parse $TOOLS_TOML into the parallel arrays
+# TOOL_NAMES/TOOL_SOURCES/TOOL_BRANCHES/TOOL_CMDS. The format is a flat set
+# of [name] sections, each with "source", "branch", and "cmd" keys (quoted
+# or unquoted); comments start with #.
 parse_tools_toml() {
   TOOL_NAMES=()
   TOOL_SOURCES=()
+  TOOL_BRANCHES=()
   TOOL_CMDS=()
 
-  local current_name="" current_source="" current_cmd=""
+  local current_name="" current_source="" current_branch="" current_cmd=""
   local line key val
 
   flush_tool() {
     if [ -n "$current_name" ]; then
       TOOL_NAMES+=("$current_name")
       TOOL_SOURCES+=("$current_source")
+      TOOL_BRANCHES+=("$current_branch")
       TOOL_CMDS+=("$current_cmd")
     fi
   }
@@ -103,6 +98,7 @@ parse_tools_toml() {
       flush_tool
       current_name="${BASH_REMATCH[1]}"
       current_source=""
+      current_branch=""
       current_cmd=""
     elif [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
@@ -111,6 +107,7 @@ parse_tools_toml() {
       val="${val#\"}"
       case "$key" in
         source) current_source="$val" ;;
+        branch) current_branch="$val" ;;
         cmd) current_cmd="$val" ;;
       esac
     fi
@@ -118,10 +115,34 @@ parse_tools_toml() {
   flush_tool
 }
 
-# 4. Install every tool listed in $TOOLS_TOML. For a local "source" path,
-#    cd into it and run "uv tool install ."; for source = "public", install
-#    the tool by name from PyPI. If the tool is already installed, force a
-#    reinstall so the latest version is picked up.
+# Clone (or update an existing clone of) a tool's github source at the
+# given branch into $TOOL_SOURCES_DIR/<name>, and print the resulting path.
+fetch_github_source() {
+  local name="$1" url="$2" branch="$3" dest
+  dest="$TOOL_SOURCES_DIR/$name"
+
+  mkdir -p "$TOOL_SOURCES_DIR"
+
+  if [ -d "$dest/.git" ]; then
+    echo "     Updating cached clone of $url ($branch)..." >&2
+    git -C "$dest" fetch --quiet origin "$branch" \
+      && git -C "$dest" checkout --quiet "$branch" \
+      && git -C "$dest" reset --quiet --hard "origin/$branch" \
+      || { echo "  !! Failed to update $url ($branch), skipping" >&2; return 1; }
+  else
+    echo "     Cloning $url ($branch)..." >&2
+    git clone --quiet --branch "$branch" "$url" "$dest" \
+      || { echo "  !! Failed to clone $url ($branch), skipping" >&2; return 1; }
+  fi
+
+  echo "$dest"
+}
+
+# 3. Install every tool listed in $TOOLS_TOML. For a github "source" URL
+#    (which requires a "branch"), clone/update it under $TOOL_SOURCES_DIR
+#    and run "uv tool install ." from the checkout; for source = "public",
+#    install the tool by name from PyPI. If the tool is already installed,
+#    force a reinstall so the latest version is picked up.
 install_tools() {
   log "Installing CLI tools from $TOOLS_TOML..."
   if [ ! -f "$TOOLS_TOML" ]; then
@@ -131,10 +152,11 @@ install_tools() {
 
   parse_tools_toml
 
-  local i name source src_dir pkg_name
+  local i name source branch src_dir pkg_name
   for ((i = 0; i < ${#TOOL_NAMES[@]}; i++)); do
     name="${TOOL_NAMES[$i]}"
     source="${TOOL_SOURCES[$i]}"
+    branch="${TOOL_BRANCHES[$i]}"
 
     if [ "$source" = "public" ]; then
       echo "  -> Installing '$name' from PyPI"
@@ -148,16 +170,20 @@ install_tools() {
     fi
 
     case "$source" in
-      /*) src_dir="$source" ;;
-      *) src_dir="$SCRIPT_DIR/$source" ;;
+      http://*|https://*|git@*|*.git)
+        if [ -z "$branch" ]; then
+          echo "  !! '$name' has a github source but no 'branch' field, skipping"
+          continue
+        fi
+        echo "  -> Installing '$name' from $source (branch $branch)"
+        src_dir="$(fetch_github_source "$name" "$source" "$branch")" || continue
+        ;;
+      *)
+        echo "  !! Unknown source '$source' for '$name' (expected a github URL or \"public\"), skipping"
+        continue
+        ;;
     esac
 
-    if [ ! -d "$src_dir" ]; then
-      echo "  !! Source directory $src_dir for '$name' not found, skipping"
-      continue
-    fi
-
-    echo "  -> Installing '$name' from $src_dir"
     pkg_name="$(grep "^name" "$src_dir/pyproject.toml" 2>/dev/null | head -n1 | cut -d\" -f2)"
     [ -z "$pkg_name" ] && pkg_name="$name"
 
@@ -173,14 +199,14 @@ install_tools() {
   uv tool list
 }
 
-# 5. Create (or update) the pseti_daq_startup systemd --user service.
+# 4. Create (or update) the pseti_daq_startup systemd --user service.
 #    Always (re)writes the service file with the current config, even if
 #    one already exists.
 create_systemd_service() {
   mkdir -p "$SYSTEMD_USER_DIR"
   mkdir -p "$(dirname "$RUNNER_SCRIPT")"
 
-  # 6. Generate the runner script that starts every tool's "cmd" from
+  # 5. Generate the runner script that starts every tool's "cmd" from
   #    $TOOLS_TOML in parallel after boot
   parse_tools_toml
   {
@@ -286,29 +312,35 @@ disable_linger() {
   log "Status: linger for $USER = $linger_status"
 }
 
-# Uninstall every CLI tool that was installed via "uv tool install"
+# Uninstall every CLI tool that was installed via "uv tool install", and
+# remove the cached github checkouts under $TOOL_SOURCES_DIR
 uninstall_tools() {
   log "Uninstalling uv-installed CLI tools..."
-  if ! command -v uv >/dev/null 2>&1; then
+  if command -v uv >/dev/null 2>&1; then
+    local packages
+    mapfile -t packages < <(uv tool list 2>/dev/null | awk '!/^- /{print $1}')
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+      log "Status: no uv tools installed."
+    else
+      for pkg in "${packages[@]}"; do
+        log "Uninstalling $pkg..."
+        uv tool uninstall -q "$pkg" || log "  !! Failed to uninstall $pkg"
+      done
+    fi
+  else
     log "Status: uv is not installed, nothing to uninstall."
-    return
   fi
 
-  local packages
-  mapfile -t packages < <(uv tool list 2>/dev/null | awk '!/^- /{print $1}')
-
-  if [ "${#packages[@]}" -eq 0 ]; then
-    log "Status: no uv tools installed."
-    return
+  if [ -d "$TOOL_SOURCES_DIR" ]; then
+    rm -rf "$TOOL_SOURCES_DIR"
+    log "Removed $TOOL_SOURCES_DIR"
   fi
 
-  for pkg in "${packages[@]}"; do
-    log "Uninstalling $pkg..."
-    uv tool uninstall -q "$pkg" || log "  !! Failed to uninstall $pkg"
-  done
-
-  log "Status: remaining uv tools"
-  uv tool list
+  if command -v uv >/dev/null 2>&1; then
+    log "Status: remaining uv tools"
+    uv tool list
+  fi
 }
 
 print_help() {
@@ -319,10 +351,11 @@ Commands:
   all              Run every step below, in order
   uv               Install uv (skipped if already installed)
   enable_linger    Enable linger for the current user (loginctl enable-linger)
-  submodule        Clone/update all git submodules
-  tools            Install every tool listed in pseti-tools.toml: "uv tool
-                   install ." for a local source path, or "uv tool install
-                   <name>" from PyPI when source = "public"
+  tools            Install every tool listed in pseti-tools.toml: for a
+                   github URL source (requires "branch"), clone/update it
+                   under .tool-sources/<name> and "uv tool install ." from
+                   there; for source = "public", "uv tool install <name>"
+                   from PyPI
   linger_service   Create/update and start the ${SERVICE_NAME} systemd --user
                    service. The service runs each tool's "cmd" from
                    pseti-tools.toml after boot. Always overwrites the
@@ -347,7 +380,6 @@ main() {
     all)
       run_step "Install uv" install_uv
       run_step "Enable linger" enable_linger
-      run_step "Clone submodules" clone_submodules
       run_step "Install CLI tools" install_tools
       run_step "Create/update systemd service" create_systemd_service
       run_step "Start systemd service" start_systemd_service
@@ -358,9 +390,6 @@ main() {
       ;;
     enable_linger)
       run_step "Enable linger" enable_linger
-      ;;
-    submodule)
-      run_step "Clone submodules" clone_submodules
       ;;
     tools)
       run_step "Install CLI tools" install_tools
@@ -373,7 +402,7 @@ main() {
       run_step "Uninstall uv tools" uninstall_tools
       run_step "Remove systemd service" remove_systemd_service
       run_step "Disable linger" disable_linger
-      log "Clean complete: uv tools uninstalled, ${SERVICE_NAME}.service removed, linger disabled."
+      log "Clean complete: uv tools uninstalled, cached tool sources removed, ${SERVICE_NAME}.service removed, linger disabled."
       ;;
     -h|--help)
       print_help

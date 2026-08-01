@@ -1,12 +1,15 @@
 # Tools installed and started by install.sh.
 #
 # Each [section] name is the tool's identifier.
-#   source = a local path (relative to this file, or absolute) to install
-#            via "uv tool install ."; or the literal value "public" to
-#            install the tool by name from PyPI via "uv tool install <name>"
+#   source = a github clone URL, installed by cloning it into
+#            .tool-sources/<name> and running "uv tool install ." there
+#            (requires "branch"); or the literal value "public" to install
+#            the tool by name from PyPI via "uv tool install <name>"
+#   branch = required when source is a github URL: the branch to clone/pull
 #   cmd    = the command line "install.sh linger_service" adds to
 #            run_daq_tools.sh to start this tool at boot
 
 [gnss-lbe]
-source = "./gnss_lbe"
+source = "https://github.com/liuweiseu/lbe1420_panoseti.git"
+branch = "feature/profile"
 cmd = "gnss-lbe --profile palomar"
