@@ -1,0 +1,12 @@
+# Tools installed and started by install.sh.
+#
+# Each [section] name is the tool's identifier.
+#   source = a local path (relative to this file, or absolute) to install
+#            via "uv tool install ."; or the literal value "public" to
+#            install the tool by name from PyPI via "uv tool install <name>"
+#   cmd    = the command line "install.sh linger_service" adds to
+#            run_daq_tools.sh to start this tool at boot
+
+[gnss-lbe]
+source = "./gnss_lbe"
+cmd = "gnss-lbe --profile palomar"

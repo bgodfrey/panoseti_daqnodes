@@ -10,6 +10,7 @@ SERVICE_FILE="$SYSTEMD_USER_DIR/${SERVICE_NAME}.service"
 RUNNER_SCRIPT="$SCRIPT_DIR/scripts/run_daq_tools.sh"
 UV_BIN_DIR="$HOME/.local/bin"
 DEPLOYED_RUNNER_SCRIPT="$UV_BIN_DIR/run_daq_tools.sh"
+TOOLS_TOML="$SCRIPT_DIR/pseti-tools.toml"
 SEP_WIDTH=68
 SEP="$(printf '%*s' "$SEP_WIDTH" '' | tr ' ' '-')"
 
@@ -74,20 +75,99 @@ clone_submodules() {
   git -C "$SCRIPT_DIR" submodule status
 }
 
-# 4. Enter each submodule and install its CLI tool. If the tool is already
-#    installed, force a reinstall so the latest local version is picked up.
-install_submodule_tools() {
-  log "Installing CLI tools from submodules..."
-  git -C "$SCRIPT_DIR" submodule foreach --quiet '
-    echo "  -> Installing tool from submodule: $name"
-    pkg_name=$(grep "^name" pyproject.toml | head -n1 | cut -d\" -f2)
-    if [ -n "$pkg_name" ] && uv tool list 2>/dev/null | grep -qE "^${pkg_name}[[:space:]]"; then
-      echo "     $pkg_name is already installed, reinstalling to get the latest version..."
-      uv tool install -q --reinstall . || echo "  !! Failed to reinstall tool from $name, skipping"
-    else
-      uv tool install -q . || echo "  !! Failed to install tool from $name, skipping"
+# Parse $TOOLS_TOML into the parallel arrays TOOL_NAMES/TOOL_SOURCES/TOOL_CMDS.
+# The format is a flat set of [name] sections, each with "source" and "cmd"
+# keys (quoted or unquoted); comments start with #.
+parse_tools_toml() {
+  TOOL_NAMES=()
+  TOOL_SOURCES=()
+  TOOL_CMDS=()
+
+  local current_name="" current_source="" current_cmd=""
+  local line key val
+
+  flush_tool() {
+    if [ -n "$current_name" ]; then
+      TOOL_NAMES+=("$current_name")
+      TOOL_SOURCES+=("$current_source")
+      TOOL_CMDS+=("$current_cmd")
     fi
-  '
+  }
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+
+    if [[ "$line" =~ ^\[([^]]+)\]$ ]]; then
+      flush_tool
+      current_name="${BASH_REMATCH[1]}"
+      current_source=""
+      current_cmd=""
+    elif [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      val="${val%\"}"
+      val="${val#\"}"
+      case "$key" in
+        source) current_source="$val" ;;
+        cmd) current_cmd="$val" ;;
+      esac
+    fi
+  done < "$TOOLS_TOML"
+  flush_tool
+}
+
+# 4. Install every tool listed in $TOOLS_TOML. For a local "source" path,
+#    cd into it and run "uv tool install ."; for source = "public", install
+#    the tool by name from PyPI. If the tool is already installed, force a
+#    reinstall so the latest version is picked up.
+install_tools() {
+  log "Installing CLI tools from $TOOLS_TOML..."
+  if [ ! -f "$TOOLS_TOML" ]; then
+    log "Status: $TOOLS_TOML not found, nothing to install."
+    return
+  fi
+
+  parse_tools_toml
+
+  local i name source src_dir pkg_name
+  for ((i = 0; i < ${#TOOL_NAMES[@]}; i++)); do
+    name="${TOOL_NAMES[$i]}"
+    source="${TOOL_SOURCES[$i]}"
+
+    if [ "$source" = "public" ]; then
+      echo "  -> Installing '$name' from PyPI"
+      if uv tool list 2>/dev/null | grep -qE "^${name}[[:space:]]"; then
+        echo "     $name is already installed, reinstalling to get the latest version..."
+        uv tool install -q --reinstall "$name" || echo "  !! Failed to reinstall $name, skipping"
+      else
+        uv tool install -q "$name" || echo "  !! Failed to install $name, skipping"
+      fi
+      continue
+    fi
+
+    case "$source" in
+      /*) src_dir="$source" ;;
+      *) src_dir="$SCRIPT_DIR/$source" ;;
+    esac
+
+    if [ ! -d "$src_dir" ]; then
+      echo "  !! Source directory $src_dir for '$name' not found, skipping"
+      continue
+    fi
+
+    echo "  -> Installing '$name' from $src_dir"
+    pkg_name="$(grep "^name" "$src_dir/pyproject.toml" 2>/dev/null | head -n1 | cut -d\" -f2)"
+    [ -z "$pkg_name" ] && pkg_name="$name"
+
+    if uv tool list 2>/dev/null | grep -qE "^${pkg_name}[[:space:]]"; then
+      echo "     $pkg_name is already installed, reinstalling to get the latest version..."
+      (cd "$src_dir" && uv tool install -q --reinstall .) || echo "  !! Failed to reinstall '$name', skipping"
+    else
+      (cd "$src_dir" && uv tool install -q .) || echo "  !! Failed to install '$name', skipping"
+    fi
+  done
 
   log "Status: installed uv tools"
   uv tool list
@@ -100,30 +180,33 @@ create_systemd_service() {
   mkdir -p "$SYSTEMD_USER_DIR"
   mkdir -p "$(dirname "$RUNNER_SCRIPT")"
 
-  # 6. Generate the runner script that starts all installed uv tools in
-  #    parallel after boot, each with --profile palomar
-  cat > "$RUNNER_SCRIPT" <<'EOF'
-#!/usr/bin/env bash
-set -uo pipefail
-export PATH="$HOME/.local/bin:$PATH"
-
-mapfile -t TOOLS < <(uv tool list 2>/dev/null | awk '/^- /{print $2}')
-
-if [ "${#TOOLS[@]}" -eq 0 ]; then
-  echo "No uv tools installed, nothing to start."
-  exit 0
-fi
-
-pids=()
-for tool in "${TOOLS[@]}"; do
-  echo "Starting $tool --profile palomar"
-  "$tool" --profile palomar &
-  pids+=("$!")
-done
-
-# Wait for all tool processes in parallel; one exiting doesn't affect the others
-wait "${pids[@]}"
-EOF
+  # 6. Generate the runner script that starts every tool's "cmd" from
+  #    $TOOLS_TOML in parallel after boot
+  parse_tools_toml
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -uo pipefail'
+    echo 'export PATH="$HOME/.local/bin:$PATH"'
+    echo ''
+    echo 'pids=()'
+    echo ''
+    local i cmd
+    for ((i = 0; i < ${#TOOL_NAMES[@]}; i++)); do
+      cmd="${TOOL_CMDS[$i]}"
+      [ -z "$cmd" ] && continue
+      printf 'echo "Starting: %s"\n' "$cmd"
+      printf '%s &\n' "$cmd"
+      echo 'pids+=("$!")'
+      echo ''
+    done
+    echo 'if [ "${#pids[@]}" -eq 0 ]; then'
+    echo '  echo "No tools configured in pseti-tools.toml, nothing to start."'
+    echo '  exit 0'
+    echo 'fi'
+    echo ''
+    echo '# Wait for all tool processes in parallel; one exiting does not affect the others'
+    echo 'wait "${pids[@]}"'
+  } > "$RUNNER_SCRIPT"
   chmod +x "$RUNNER_SCRIPT"
 
   # Deploy a copy to ~/.local/bin so the service keeps working even if this
@@ -237,10 +320,12 @@ Commands:
   uv               Install uv (skipped if already installed)
   enable_linger    Enable linger for the current user (loginctl enable-linger)
   submodule        Clone/update all git submodules
-  tools            Install the CLI tool from each submodule (uv tool install .)
+  tools            Install every tool listed in pseti-tools.toml: "uv tool
+                   install ." for a local source path, or "uv tool install
+                   <name>" from PyPI when source = "public"
   linger_service   Create/update and start the ${SERVICE_NAME} systemd --user
-                   service, which runs every installed CLI tool with
-                   --profile palomar after boot. Always overwrites the
+                   service. The service runs each tool's "cmd" from
+                   pseti-tools.toml after boot. Always overwrites the
                    service file with the current config.
   clean            Restore the system to its pre-install state: uninstall all
                    uv-installed CLI tools, stop/disable/remove the
@@ -263,10 +348,10 @@ main() {
       run_step "Install uv" install_uv
       run_step "Enable linger" enable_linger
       run_step "Clone submodules" clone_submodules
-      run_step "Install submodule CLI tools" install_submodule_tools
+      run_step "Install CLI tools" install_tools
       run_step "Create/update systemd service" create_systemd_service
       run_step "Start systemd service" start_systemd_service
-      log "All steps completed. '${SERVICE_NAME}' will auto-run all installed CLI tools with --profile palomar after boot."
+      log "All steps completed. '${SERVICE_NAME}' will auto-run every tool from pseti-tools.toml after boot."
       ;;
     uv)
       run_step "Install uv" install_uv
@@ -278,7 +363,7 @@ main() {
       run_step "Clone submodules" clone_submodules
       ;;
     tools)
-      run_step "Install submodule CLI tools" install_submodule_tools
+      run_step "Install CLI tools" install_tools
       ;;
     linger_service)
       run_step "Create/update systemd service" create_systemd_service
