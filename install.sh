@@ -124,15 +124,25 @@ fetch_github_source() {
   mkdir -p "$TOOL_SOURCES_DIR"
 
   if [ -d "$dest/.git" ]; then
-    echo "     Updating cached clone of $url ($branch)..." >&2
-    git -C "$dest" fetch --quiet origin "$branch" \
+    printf '     Updating %s (%s)....' "$url" "$branch" >&2
+    if git -C "$dest" fetch --quiet origin "$branch" \
       && git -C "$dest" checkout --quiet "$branch" \
-      && git -C "$dest" reset --quiet --hard "origin/$branch" \
-      || { echo "  !! Failed to update $url ($branch), skipping" >&2; return 1; }
+      && git -C "$dest" reset --quiet --hard "origin/$branch"; then
+      echo "Done" >&2
+    else
+      echo "Failed" >&2
+      echo "  !! Failed to update $url ($branch), skipping" >&2
+      return 1
+    fi
   else
-    echo "     Cloning $url ($branch)..." >&2
-    git clone --quiet --branch "$branch" "$url" "$dest" \
-      || { echo "  !! Failed to clone $url ($branch), skipping" >&2; return 1; }
+    printf '     Cloning %s (%s)....' "$url" "$branch" >&2
+    if git clone --quiet --branch "$branch" "$url" "$dest"; then
+      echo "Done" >&2
+    else
+      echo "Failed" >&2
+      echo "  !! Failed to clone $url ($branch), skipping" >&2
+      return 1
+    fi
   fi
 
   echo "$dest"
