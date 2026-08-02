@@ -38,7 +38,6 @@ center_line() {
 run_step() {
   local desc="$1"
   shift
-  echo ""
   log "$SEP"
   log "$(center_line " STEP: $desc " "$SEP_WIDTH" '*')"
   log "$SEP"
@@ -46,6 +45,7 @@ run_step() {
   log "$SEP"
   log "$(center_line " DONE: $desc " "$SEP_WIDTH" '*')"
   log "$SEP"
+  echo ""
 }
 
 # 1. Install uv (skip if already installed)
@@ -535,7 +535,7 @@ main() {
       run_step "Create log directory" create_log_dir
       run_step "Create/update systemd services" create_systemd_services
       run_step "Start systemd services" confirm_and_start_services
-      log "All steps completed. '${SERVICE_NAME}' will run each oneshot tool once after boot; '${DAEMON_SERVICE_NAME}' will keep each daemon tool running, restarting it on crash."
+      log "All steps completed."
       ;;
     uv)
       run_step "Install uv" install_uv
