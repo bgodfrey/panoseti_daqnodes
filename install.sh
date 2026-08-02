@@ -557,7 +557,7 @@ main() {
       run_step "Uninstall uv tools" uninstall_tools
       run_step "Remove systemd services" remove_systemd_services
       run_step "Disable linger" disable_linger
-      log "Clean complete: uv tools uninstalled, cached tool sources removed, ${SERVICE_NAME}.service and ${DAEMON_SERVICE_NAME}.service removed, linger disabled."
+      log "Clean complete."
       ;;
     -h|--help)
       print_help
