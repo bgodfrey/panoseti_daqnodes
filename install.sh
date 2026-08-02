@@ -401,6 +401,25 @@ start_systemd_services() {
   log "Status: ${DAEMON_SERVICE_NAME}.service active = $daemon_active_status"
 }
 
+# Ask whether to start both services now; start them if the user agrees,
+# otherwise leave them enabled-but-stopped and print how to start them later.
+confirm_and_start_services() {
+  local answer
+  read -r -p "Start ${SERVICE_NAME}.service and ${DAEMON_SERVICE_NAME}.service now? [y/N] " answer
+
+  case "$answer" in
+    y|Y|yes|Yes|YES)
+      start_systemd_services
+      ;;
+    *)
+      log "Not starting the services now."
+      log "To start them later, run:"
+      log "  systemctl --user start ${SERVICE_NAME}.service"
+      log "  systemctl --user start ${DAEMON_SERVICE_NAME}.service"
+      ;;
+  esac
+}
+
 # Stop, disable, and remove both pseti_daq systemd --user services
 remove_systemd_services() {
   local svc
@@ -486,12 +505,12 @@ Commands:
                    (skipped if it already exists). Falls back to sudo (and
                    will prompt for a password) if a plain mkdir fails, then
                    chowns the directory to the current user.
-  linger_service   Create/update and start both systemd --user services:
-                   ${SERVICE_NAME} (oneshot; runs each non-daemon tool's
-                   "cmd" once after boot) and ${DAEMON_SERVICE_NAME}
-                   (restarted on crash; runs each tool with mode = "daemon").
-                   Always overwrites both service files with the current
-                   config.
+  linger_service   Create/update both systemd --user services: ${SERVICE_NAME}
+                   (oneshot; runs each non-daemon tool's "cmd" once after
+                   boot) and ${DAEMON_SERVICE_NAME} (restarted on crash;
+                   runs each tool with mode = "daemon"). Always overwrites
+                   both service files with the current config, then asks
+                   whether to start them now.
   clean            Restore the system to its pre-install state: uninstall all
                    uv-installed CLI tools, stop/disable/remove both
                    pseti_daq services, and disable linger
@@ -515,7 +534,7 @@ main() {
       run_step "Install CLI tools" install_tools
       run_step "Create log directory" create_log_dir
       run_step "Create/update systemd services" create_systemd_services
-      run_step "Start systemd services" start_systemd_services
+      run_step "Start systemd services" confirm_and_start_services
       log "All steps completed. '${SERVICE_NAME}' will run each oneshot tool once after boot; '${DAEMON_SERVICE_NAME}' will keep each daemon tool running, restarting it on crash."
       ;;
     uv)
@@ -532,7 +551,7 @@ main() {
       ;;
     linger_service)
       run_step "Create/update systemd services" create_systemd_services
-      run_step "Start systemd services" start_systemd_services
+      run_step "Start systemd services" confirm_and_start_services
       ;;
     clean)
       run_step "Uninstall uv tools" uninstall_tools
