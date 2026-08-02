@@ -20,6 +20,17 @@ SEP_WIDTH=68
 SEP="$(printf '%*s' "$SEP_WIDTH" '' | tr ' ' '-')"
 
 log() { echo "[install.sh] $*"; }
+# Like log(), but without a trailing newline, so a later plain "echo" can
+# finish the line (used for "Cloning ....Done"-style progress messages).
+logn() { printf '[install.sh] %s' "$*"; }
+# Prefix every line of stdin with "[install.sh] ", so piped command output
+# (e.g. "uv tool list") lines up with our own log() lines.
+log_lines() {
+  local line
+  while IFS= read -r line; do
+    log "$line"
+  done
+}
 
 # Center `text` within `width`, padding both sides with `padchar`.
 center_line() {
@@ -145,23 +156,23 @@ fetch_github_source() {
   mkdir -p "$TOOL_SOURCES_DIR"
 
   if [ -d "$dest/.git" ]; then
-    printf '     Updating %s (%s)....' "$url" "$branch" >&2
+    logn "     Updating $url ($branch)...." >&2
     if git -C "$dest" fetch --quiet origin "$branch" \
       && git -C "$dest" checkout --quiet "$branch" \
       && git -C "$dest" reset --quiet --hard "origin/$branch"; then
       echo "Done" >&2
     else
       echo "Failed" >&2
-      echo "  !! Failed to update $url ($branch), skipping" >&2
+      log "  !! Failed to update $url ($branch), skipping" >&2
       return 1
     fi
   else
-    printf '     Cloning %s (%s)....' "$url" "$branch" >&2
+    logn "     Cloning $url ($branch)...." >&2
     if git clone --quiet --branch "$branch" "$url" "$dest"; then
       echo "Done" >&2
     else
       echo "Failed" >&2
-      echo "  !! Failed to clone $url ($branch), skipping" >&2
+      log "  !! Failed to clone $url ($branch), skipping" >&2
       return 1
     fi
   fi
@@ -190,12 +201,12 @@ install_tools() {
     branch="${TOOL_BRANCHES[$i]}"
 
     if [ "$source" = "public" ]; then
-      echo "  -> Installing '$name' from PyPI"
+      log "  -> Installing '$name' from PyPI"
       if uv tool list 2>/dev/null | grep -qE "^${name}[[:space:]]"; then
-        echo "     $name is already installed, reinstalling to get the latest version..."
-        uv tool install -q --reinstall "$name" || echo "  !! Failed to reinstall $name, skipping"
+        log "     $name is already installed, reinstalling to get the latest version..."
+        uv tool install -q --reinstall "$name" || log "  !! Failed to reinstall $name, skipping"
       else
-        uv tool install -q "$name" || echo "  !! Failed to install $name, skipping"
+        uv tool install -q "$name" || log "  !! Failed to install $name, skipping"
       fi
       continue
     fi
@@ -203,14 +214,14 @@ install_tools() {
     case "$source" in
       http://*|https://*|git@*|*.git)
         if [ -z "$branch" ]; then
-          echo "  !! '$name' has a github source but no 'branch' field, skipping"
+          log "  !! '$name' has a github source but no 'branch' field, skipping"
           continue
         fi
-        echo "  -> Installing '$name' from $source (branch $branch)"
+        log "  -> Installing '$name' from $source (branch $branch)"
         src_dir="$(fetch_github_source "$name" "$source" "$branch")" || continue
         ;;
       *)
-        echo "  !! Unknown source '$source' for '$name' (expected a github URL or \"public\"), skipping"
+        log "  !! Unknown source '$source' for '$name' (expected a github URL or \"public\"), skipping"
         continue
         ;;
     esac
@@ -219,15 +230,15 @@ install_tools() {
     [ -z "$pkg_name" ] && pkg_name="$name"
 
     if uv tool list 2>/dev/null | grep -qE "^${pkg_name}[[:space:]]"; then
-      echo "     $pkg_name is already installed, reinstalling to get the latest version..."
-      (cd "$src_dir" && uv tool install -q --reinstall .) || echo "  !! Failed to reinstall '$name', skipping"
+      log "     $pkg_name is already installed, reinstalling to get the latest version..."
+      (cd "$src_dir" && uv tool install -q --reinstall .) || log "  !! Failed to reinstall '$name', skipping"
     else
-      (cd "$src_dir" && uv tool install -q .) || echo "  !! Failed to install '$name', skipping"
+      (cd "$src_dir" && uv tool install -q .) || log "  !! Failed to install '$name', skipping"
     fi
   done
 
   log "Status: installed uv tools"
-  uv tool list
+  uv tool list | log_lines
 }
 
 # 4. Create the log directory tools write to ([logs].dir in $TOOLS_TOML).
@@ -377,8 +388,8 @@ WantedBy=default.target
 EOF
 
   systemctl --user daemon-reload
-  systemctl --user enable "${SERVICE_NAME}.service"
-  systemctl --user enable "${DAEMON_SERVICE_NAME}.service"
+  systemctl --user enable --quiet "${SERVICE_NAME}.service"
+  systemctl --user enable --quiet "${DAEMON_SERVICE_NAME}.service"
 
   local enabled_status daemon_enabled_status
   enabled_status="$(systemctl --user is-enabled "${SERVICE_NAME}.service" 2>&1 || true)"
@@ -426,7 +437,7 @@ remove_systemd_services() {
   for svc in "$SERVICE_NAME" "$DAEMON_SERVICE_NAME"; do
     log "Stopping and disabling ${svc}.service..."
     systemctl --user stop "${svc}.service" 2>/dev/null || true
-    systemctl --user disable "${svc}.service" 2>/dev/null || true
+    systemctl --user disable --quiet "${svc}.service" 2>/dev/null || true
   done
 
   local f
@@ -484,7 +495,7 @@ uninstall_tools() {
 
   if command -v uv >/dev/null 2>&1; then
     log "Status: remaining uv tools"
-    uv tool list
+    uv tool list | log_lines
   fi
 }
 
