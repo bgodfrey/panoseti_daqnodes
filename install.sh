@@ -72,17 +72,19 @@ enable_linger() {
 }
 
 # Parse $TOOLS_TOML into the parallel arrays
-# TOOL_NAMES/TOOL_SOURCES/TOOL_BRANCHES/TOOL_CMDS/TOOL_MODES. The format is
-# a flat set of [name] sections, each with "source", "branch", "cmd", and
-# "mode" keys (quoted or unquoted); comments start with #.
+# TOOL_NAMES/TOOL_SOURCES/TOOL_BRANCHES/TOOL_CMDS/TOOL_MODES, plus LOGS_DIR.
+# The format has one [tools.<name>] section per tool, each with "source",
+# "branch", "cmd", and "mode" keys (quoted or unquoted), and a sibling
+# [logs] section with a "dir" key; comments start with #.
 parse_tools_toml() {
   TOOL_NAMES=()
   TOOL_SOURCES=()
   TOOL_BRANCHES=()
   TOOL_CMDS=()
   TOOL_MODES=()
+  LOGS_DIR=""
 
-  local current_name="" current_source="" current_branch="" current_cmd="" current_mode=""
+  local section="" current_name="" current_source="" current_branch="" current_cmd="" current_mode=""
   local line key val
 
   flush_tool() {
@@ -102,7 +104,12 @@ parse_tools_toml() {
 
     if [[ "$line" =~ ^\[([^]]+)\]$ ]]; then
       flush_tool
-      current_name="${BASH_REMATCH[1]}"
+      section="${BASH_REMATCH[1]}"
+      if [[ "$section" == tools.* ]]; then
+        current_name="${section#tools.}"
+      else
+        current_name=""
+      fi
       current_source=""
       current_branch=""
       current_cmd=""
@@ -112,12 +119,18 @@ parse_tools_toml() {
       val="${BASH_REMATCH[2]}"
       val="${val%\"}"
       val="${val#\"}"
-      case "$key" in
-        source) current_source="$val" ;;
-        branch) current_branch="$val" ;;
-        cmd) current_cmd="$val" ;;
-        mode) current_mode="$val" ;;
-      esac
+      if [[ "$section" == tools.* ]]; then
+        case "$key" in
+          source) current_source="$val" ;;
+          branch) current_branch="$val" ;;
+          cmd) current_cmd="$val" ;;
+          mode) current_mode="$val" ;;
+        esac
+      elif [ "$section" = "logs" ]; then
+        case "$key" in
+          dir) LOGS_DIR="$val" ;;
+        esac
+      fi
     fi
   done < "$TOOLS_TOML"
   flush_tool
@@ -217,6 +230,36 @@ install_tools() {
   uv tool list
 }
 
+# 4. Create the log directory tools write to ([logs].dir in $TOOLS_TOML).
+#    Tries a plain mkdir first; if that fails (e.g. dir under /var/log
+#    requires root), falls back to sudo, which will prompt for a password.
+#    The directory is then chowned to the current user so the pseti_daq
+#    services (which run as this user, not root) can write into it.
+create_log_dir() {
+  parse_tools_toml
+
+  if [ -z "$LOGS_DIR" ]; then
+    log "Status: no [logs].dir configured in $TOOLS_TOML, skipping."
+    return
+  fi
+
+  if [ -d "$LOGS_DIR" ]; then
+    log "Status: $LOGS_DIR already exists."
+    return
+  fi
+
+  log "Creating log directory: $LOGS_DIR"
+  if mkdir -p "$LOGS_DIR" 2>/dev/null; then
+    log "Status: created $LOGS_DIR"
+    return
+  fi
+
+  log "Need elevated privileges to create $LOGS_DIR, requesting sudo..."
+  sudo mkdir -p "$LOGS_DIR"
+  sudo chown "$USER" "$LOGS_DIR"
+  log "Status: created $LOGS_DIR (owned by $USER)"
+}
+
 # Generate a runner script at `out` from the tools in $TOOLS_TOML whose
 # mode matches `want_mode` ("oneshot" tools have no mode set, or mode !=
 # "daemon"). Every matching tool is started in the background and its pid
@@ -282,7 +325,7 @@ deploy_runner_script() {
   log "Deployed runner script to $dest"
 }
 
-# 4. Create (or update) both systemd --user services:
+# 5. Create (or update) both systemd --user services:
 #      pseti_daq_startup  (oneshot)  - runs every non-daemon tool once
 #      pseti_daq_daemons  (simple)   - runs every daemon tool, restarted on
 #                                      crash
@@ -291,7 +334,7 @@ deploy_runner_script() {
 create_systemd_services() {
   mkdir -p "$SYSTEMD_USER_DIR"
 
-  # 5. Generate the two runner scripts from $TOOLS_TOML: one for the
+  # 6. Generate the two runner scripts from $TOOLS_TOML: one for the
   #    default "oneshot" tools, one for tools with mode = "daemon".
   parse_tools_toml
   generate_runner_script "$RUNNER_SCRIPT" oneshot
@@ -439,6 +482,10 @@ Commands:
                    under .tool-sources/<name> and "uv tool install ." from
                    there; for source = "public", "uv tool install <name>"
                    from PyPI
+  log_dir          Create the [logs].dir directory from pseti-tools.toml
+                   (skipped if it already exists). Falls back to sudo (and
+                   will prompt for a password) if a plain mkdir fails, then
+                   chowns the directory to the current user.
   linger_service   Create/update and start both systemd --user services:
                    ${SERVICE_NAME} (oneshot; runs each non-daemon tool's
                    "cmd" once after boot) and ${DAEMON_SERVICE_NAME}
@@ -466,6 +513,7 @@ main() {
       run_step "Install uv" install_uv
       run_step "Enable linger" enable_linger
       run_step "Install CLI tools" install_tools
+      run_step "Create log directory" create_log_dir
       run_step "Create/update systemd services" create_systemd_services
       run_step "Start systemd services" start_systemd_services
       log "All steps completed. '${SERVICE_NAME}' will run each oneshot tool once after boot; '${DAEMON_SERVICE_NAME}' will keep each daemon tool running, restarting it on crash."
@@ -478,6 +526,9 @@ main() {
       ;;
     tools)
       run_step "Install CLI tools" install_tools
+      ;;
+    log_dir)
+      run_step "Create log directory" create_log_dir
       ;;
     linger_service)
       run_step "Create/update systemd services" create_systemd_services
