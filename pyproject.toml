@@ -13,6 +13,6 @@ dependencies = [
 package = false
 
 [tool.uv.sources]
-panoseti-grpc = { git = "ssh://git@github.com/bgGodfrey/panoseti_grpc.git", branch = "gnss-orchestrator" }
-ublox-f9t-config = { git = "ssh://git@github.com/bgGodfrey/U-Blox_F9T_Config.git", branch = "uv-tool" }
-lbe1420-config = { git = "ssh://git@github.com/bgGodfrey/lbe1420_panoseti.git", branch = "uv-tool" }
+panoseti-grpc = { git = "ssh://git@github.com/bgodfrey/panoseti_grpc.git", branch = "gnss-orchestrator" }
+ublox-f9t-config = { git = "ssh://git@github.com/bgodfrey/U-Blox_F9T_Config.git", branch = "uv-tool" }
+lbe1420-config = { git = "ssh://git@github.com/bgodfrey/lbe1420_panoseti.git", branch = "uv-tool" }
