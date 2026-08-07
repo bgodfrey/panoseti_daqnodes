@@ -1,0 +1,18 @@
+[project]
+name = "panoseti-daq-runtime"
+version = "0.1.0"
+description = "Locked runtime environment for PANOSETI DAQ nodes"
+requires-python = ">=3.14"
+dependencies = [
+    "lbe1420-config",
+    "panoseti-grpc",
+    "ublox-f9t-config",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+panoseti-grpc = { git = "ssh://git@github.com/bgGodfrey/panoseti_grpc.git", branch = "gnss-orchestrator" }
+ublox-f9t-config = { git = "ssh://git@github.com/bgGodfrey/U-Blox_F9T_Config.git", branch = "uv-tool" }
+lbe1420-config = { git = "ssh://git@github.com/bgGodfrey/lbe1420_panoseti.git", branch = "uv-tool" }
